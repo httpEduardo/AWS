@@ -1,0 +1,18 @@
+# Cache objects
+packer_cache/
+
+# For built boxes
+*.box
+
+# For terraform
+*.tfstate
+*.tfstate.backup
+*.terraform.tfstate.lock.info
+.terraform/
+*.tfvars
+
+# Inspec files
+inspec.lock
+
+# SSL certs
+*.pem

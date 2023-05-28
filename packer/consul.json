@@ -1,0 +1,52 @@
+{
+  "description": "Consul Storage Configuration for Vault",
+  "variables": {
+    "version": "0.6.0",
+    "install_bucket": "fto-shared-assets",
+    "consul_bin": "consul_1.6.3_linux_amd64.zip",
+    "consul_version": "1.6.3",
+    "source_ami": "ami-01ed306a12b7d1c96",
+    "os_version_tag": "CentOS 7",
+    "ssh_user": "centos",
+    "aws_region": "us-west-2",
+    "inst_type": "t2.micro",
+    "inst_profile": "Packer-S3-Access",
+    "tag": "vault_consul_cluster",
+    "siz": "3"
+  },
+  "builders": [
+    {
+      "type": "amazon-ebs",
+      "region": "{{user `aws_region`}}",
+      "source_ami": "{{user `source_ami`}}",
+      "instance_type": "{{user `inst_type`}}",
+      "ssh_username": "{{user `ssh_user`}}",
+      "ami_name": "consul-oss-{{user `consul_version`}}-{{isotime \"2006-01-02_03.04.05\"}}",
+      "iam_instance_profile": "{{user `inst_profile`}}",
+      "communicator": "ssh",
+      "tags": {
+        "OS_Version": "{{user `os_version_tag`}}",
+        "Base_AMI_Name": "{{ .SourceAMIName }}",
+        "Installed_Software": "Consul {{user `consul_version`}}",
+        "Version": "{{user `version`}}",
+        "Name": "HashiCorp Consul {{user `consul_version`}}",
+        "owner": "team-fto@hashicorp.com"
+      }
+    }
+  ],
+  "_provisioners_comment": "Comment",
+  "provisioners": [
+    {
+      "type": "file",
+      "source": "{{template_dir}}/scripts",
+      "destination": "/tmp"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "bash /tmp/scripts/install-consul.sh --install-bucket {{user `install_bucket`}} --consul-bin {{user `consul_bin`}} --tag {{user `tag`}} --cluster-size {{user `siz`}} --client 0",
+        "sudo sed -i 's/level=DEBUG/level=INFO/' /etc/cloud/cloud.cfg.d/05_logging.cfg > /tmp/05_logging.cfg"
+      ]
+    }
+  ]
+}

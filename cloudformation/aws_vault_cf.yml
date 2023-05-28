@@ -1,0 +1,1350 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Mappings:
+  RegionMap:
+      us-west-2:
+        vault: ami-0fd4fb2ec2a1d1053
+        consul: ami-016d5d73d7db33467
+      us-east-1:
+        vault: ami-0c4b73c6fd3189b3a
+        consul: ami-09f7bee50e46a3c28
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Required Parameters"
+        Parameters:
+          - FQDN
+          - ClusterZones
+          - SSHKeyName
+      -
+        Label:
+          default: "Optional Parameters"
+        Parameters:
+          - Route53Enabled
+          - Route53ZoneId
+          - BastionAmiId
+    ParameterLabels:
+      FQDN:
+        default: "What hostname will you use for your Vault cluster?"
+      ClusterZones:
+        default: "Choose three Availability Zones:"
+      SSHKeyName:
+        default: "SSH Key Name"
+      Route53Enabled:
+        default: "Using AWS Route 53 for DNS?"
+      Route53ZoneId:
+        default: "Only needed if the previous answer is true."
+      BastionAmiId:
+        default: "AMI for the bastion host. You should not need to change this."
+Parameters:
+  FQDN:
+    Type: String
+    Description: "Example: vault.hashidemos.io"
+  ClusterZones:
+    Type: List<AWS::EC2::AvailabilityZone::Name>
+    Description: "Example: us-east-1a, us-east-1b, us-east-1c"
+  SSHKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Use this key to access your bastion host via SSH.
+  Route53Enabled:
+    Description: Boolean. Set to true if your FQDN managed by AWS Route 53.
+    Default: true
+    Type: String
+    AllowedValues: [true, false]
+  Route53ZoneId:
+    Description: Make sure this matches with your FQDN
+    Type: AWS::Route53::HostedZone::Id
+  BastionAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+Conditions:
+  ShouldCreateDNSRecords:
+    !Equals [true, !Ref Route53Enabled]
+Resources:
+  VaultKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Vault Unseal KMS Key
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: vault-unseal-1
+        Statement:
+        - Sid: Allow administration of the key
+          Effect: Allow
+          Principal:
+            AWS:
+              Fn::Join:
+              - ''
+              - - 'arn:aws:iam::'
+                - !Ref AWS::AccountId
+                - ":root"
+          Action:
+          - kms:Create*
+          - kms:Describe*
+          - kms:Enable*
+          - kms:List*
+          - kms:Put*
+          - kms:Update*
+          - kms:Revoke*
+          - kms:Disable*
+          - kms:Get*
+          - kms:Delete*
+          - kms:ScheduleKeyDeletion
+          - kms:CancelKeyDeletion
+          - kms:TagResource
+          Resource: "*"
+        - Sid: Allow use of the key
+          Effect: Allow
+          Principal:
+            AWS:
+              Fn::Join:
+              - ''
+              - - 'arn:aws:iam::'
+                - !Ref AWS::AccountId
+                - ":role/"
+                - !Ref VaultClusterServerRole
+          Action:
+          - kms:Encrypt
+          - kms:Decrypt
+          - kms:ReEncrypt
+          - kms:GenerateDataKey*
+          - kms:DescribeKey
+          Resource: "*"
+  VaultKMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Join [ '', ['alias/', !Join [ '_', !Split [ '.', !Ref FQDN ] ], '-VaultUnsealKey' ] ]
+      TargetKeyId: !Ref VaultKMSKey
+  VaultClusterServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: vault-cluster-server-role-policy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - ec2:DescribeInstances
+            - ec2:DescribeTags
+            - cloudwatch:PutMetricData
+            - cloudwatch:PutMetricAlarm
+            - sns:Publish
+            - ec2messages:GetMessages
+            - autoscaling:DescribeAutoScalingGroups
+            Resource: "*"
+      - PolicyName: vault-kms-unseal
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - kms:Encrypt
+            - kms:Decrypt
+            - kms:DescribeKey
+            - kms:ListResourceTags
+            - kms:TagResource
+            Resource: "*"
+      - PolicyName: vault-consul-agent-token
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - secretsmanager:*
+            Resource:
+            - !Ref VaultConsulAgentToken
+      - PolicyName: consul-bootstrap-token
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - secretsmanager:*
+            Resource:
+            - !Ref ConsulBootstrapToken
+      - PolicyName: consul-server-agent-token
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - secretsmanager:*
+            Resource:
+            - !Ref ConsulServerAgentToken
+  VaultConsulAgentToken:
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Description: Consul Agent Token - Not Created
+  ConsulBootstrapToken:
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Description: Consul Bootstrap Token - Not Created
+  ConsulServerAgentToken:
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Description: Consul Server Agent Token - Not Created
+  VaultInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - !Ref VaultClusterServerRole
+  VaultDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: ShouldCreateDNSRecords
+    Properties:
+      HostedZoneId: !Ref Route53ZoneId
+      Comment: Public DNS record for ${FQDN}
+      Type: A
+      Name: !Ref FQDN
+      AliasTarget:
+        DNSName: !GetAtt VaultELB.DNSName
+        HostedZoneId: !GetAtt VaultELB.CanonicalHostedZoneID
+  VaultVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      InstanceTenancy: default
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'false'
+  VaultDHCPOpts:
+    Type: AWS::EC2::DHCPOptions
+    Properties:
+      DomainName:
+        Fn::Join:
+        - ''
+        - - AWS::Region
+          - ".compute.internal"
+      DomainNameServers:
+      - AmazonProvidedDNS
+  VaultDHCPOptsAssoc:
+    Type: AWS::EC2::VPCDHCPOptionsAssociation
+    Properties:
+      VpcId: !Ref VaultVPC
+      DhcpOptionsId: !Ref VaultDHCPOpts
+  VaultNetworkACLs:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VaultVPC
+  VaultEgressNetworkACL:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      CidrBlock: 0.0.0.0/0
+      Egress: 'true'
+      Protocol: "-1"
+      RuleAction: allow
+      RuleNumber: '100'
+      NetworkAclId: !Ref VaultNetworkACLs
+  VaultInternalNetworkACL:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      CidrBlock: 0.0.0.0/0
+      Protocol: "-1"
+      RuleAction: allow
+      RuleNumber: '100'
+      NetworkAclId: !Ref VaultNetworkACLs
+  VaultIGW:
+    Type: AWS::EC2::InternetGateway
+    Properties: {}
+  VaultDefaultGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VaultVPC
+      InternetGatewayId: !Ref VaultIGW
+  VaultPublicSubnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.101.0/24
+      AvailabilityZone:
+        Fn::Select:
+        - '0'
+        - !Ref ClusterZones
+      VpcId: !Ref VaultVPC
+  VaultPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.102.0/24
+      AvailabilityZone:
+        Fn::Select:
+        - '1'
+        - !Ref ClusterZones
+      VpcId: !Ref VaultVPC
+  VaultPublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.103.0/24
+      AvailabilityZone:
+        Fn::Select:
+        - '2'
+        - !Ref ClusterZones
+      VpcId: !Ref VaultVPC
+  VaultPrivateSubnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone:
+        Fn::Select:
+        - '0'
+        - !Ref ClusterZones
+      VpcId: !Ref VaultVPC
+  VaultPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone:
+        Fn::Select:
+        - '1'
+        - !Ref ClusterZones
+      VpcId: !Ref VaultVPC
+  VaultPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone:
+        Fn::Select:
+        - '2'
+        - !Ref ClusterZones
+      VpcId: !Ref VaultVPC
+  VaultPrivateRouteTable0:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VaultVPC
+  VaultPrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VaultVPC
+  VaultPrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VaultVPC
+  VaultPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VaultVPC
+  MainRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VaultVPC
+  VaultCert:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref FQDN
+      ValidationMethod: DNS
+  VaultELB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - !Ref VaultPublicSubnet0
+      - !Ref VaultPublicSubnet1
+      - !Ref VaultPublicSubnet2
+      SecurityGroups:
+      - !Ref VaultELBSG
+  VaultListenerCertificate8200:
+    Type: AWS::ElasticLoadBalancingV2::ListenerCertificate
+    Properties:
+      Certificates:
+      - CertificateArn: !Ref VaultCert
+      ListenerArn: !Ref VaultListener8200
+  VaultListener8200:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn: !Ref VaultTargetGroup8200
+      LoadBalancerArn: !Ref VaultELB
+      Certificates:
+      - CertificateArn: !Ref VaultCert
+      Port: '8200'
+      Protocol: HTTPS
+  VaultTargetGroup8200:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 5
+      HealthCheckProtocol: HTTPS
+      HealthCheckTimeoutSeconds: 3
+      HealthCheckPath: "/v1/sys/health"
+      HealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      Port: 8200
+      Protocol: HTTPS
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: '20'
+      Targets:
+      - Id: !Ref VaultServer0
+        Port: 8200
+      - Id: !Ref VaultServer1
+        Port: 8200
+      - Id: !Ref VaultServer2
+        Port: 8200
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VaultVPC
+  VaultEIP0:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  VaultEIP1:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  VaultEIP2:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  VaultNATGateway0:
+    DependsOn: VaultDefaultGatewayAttachment
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId:
+        Fn::GetAtt:
+        - VaultEIP0
+        - AllocationId
+      SubnetId: !Ref VaultPublicSubnet0
+  VaultNATGateway1:
+    DependsOn: VaultDefaultGatewayAttachment
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId:
+        Fn::GetAtt:
+        - VaultEIP1
+        - AllocationId
+      SubnetId: !Ref VaultPublicSubnet1
+  VaultNATGateway2:
+    DependsOn: VaultDefaultGatewayAttachment
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId:
+        Fn::GetAtt:
+        - VaultEIP2
+        - AllocationId
+      SubnetId: !Ref VaultPublicSubnet2
+  VaultClusterSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: The SG for vault Servers Internal comms
+      VpcId: !Ref VaultVPC
+  VaultELBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable vault UI and API access to the elb
+      VpcId: !Ref VaultVPC
+  VaultPrivateSubnetAclAssoc0:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      NetworkAclId: !Ref VaultNetworkACLs
+      SubnetId: !Ref VaultPrivateSubnet0
+  VaultPrivateSubnetAclAssoc1:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      NetworkAclId: !Ref VaultNetworkACLs
+      SubnetId: !Ref VaultPrivateSubnet1
+  VaultPrivateSubnetAclAssoc2:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      NetworkAclId: !Ref VaultNetworkACLs
+      SubnetId: !Ref VaultPrivateSubnet2
+  VaultPublicSubnetAclAssoc0:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      NetworkAclId: !Ref VaultNetworkACLs
+      SubnetId: !Ref VaultPublicSubnet0
+  VaultPublicSubnetAclAssoc1:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      NetworkAclId: !Ref VaultNetworkACLs
+      SubnetId: !Ref VaultPublicSubnet1
+  VaultPublicSubnetAclAssoc2:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      NetworkAclId: !Ref VaultNetworkACLs
+      SubnetId: !Ref VaultPublicSubnet2
+  VaultPrivateSubnetRouteAssoc0:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref VaultPrivateRouteTable0
+      SubnetId: !Ref VaultPrivateSubnet0
+  VaultPrivateSubnetRouteAssoc1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref VaultPrivateRouteTable1
+      SubnetId: !Ref VaultPrivateSubnet1
+  VaultPrivateSubnetRouteAssoc2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref VaultPrivateRouteTable2
+      SubnetId: !Ref VaultPrivateSubnet2
+  VaultPublicSubnetRouteAssoc0:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref VaultPublicRouteTable
+      SubnetId: !Ref VaultPublicSubnet0
+  VaultPublicSubnetRouteAssoc1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref VaultPublicRouteTable
+      SubnetId: !Ref VaultPublicSubnet1
+  VaultPublicSubnetRouteAssoc2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref VaultPublicRouteTable
+      SubnetId: !Ref VaultPublicSubnet2
+  VaultPrivateRoute0:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref VaultPrivateRouteTable0
+      NatGatewayId: !Ref VaultNATGateway0
+  VaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref VaultPrivateRouteTable1
+      NatGatewayId: !Ref VaultNATGateway1
+  VaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref VaultPrivateRouteTable2
+      NatGatewayId: !Ref VaultNATGateway2
+  VaultPublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref VaultPublicRouteTable
+      GatewayId: !Ref VaultIGW
+    DependsOn: VaultDefaultGatewayAttachment
+  VaultClusterIngressPort22:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VaultClusterSG
+      IpProtocol: tcp
+      FromPort: '22'
+      ToPort: '22'
+      CidrIp: 0.0.0.0/0
+  VaultClusterInternalIngressPorts:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VaultClusterSG
+      IpProtocol: tcp
+      FromPort: '8200'
+      ToPort: '8201'
+      SourceSecurityGroupId: !Ref VaultClusterSG
+      SourceSecurityGroupOwnerId: !Ref AWS::AccountId
+  VaultClusterELBIngressPorts:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VaultClusterSG
+      IpProtocol: tcp
+      FromPort: '8200'
+      ToPort: '8200'
+      SourceSecurityGroupId: !Ref VaultELBSG
+      SourceSecurityGroupOwnerId: !Ref AWS::AccountId
+  VaultClusterInternalIngressPort8301udp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VaultClusterSG
+      IpProtocol: udp
+      FromPort: '8301'
+      ToPort: '8302'
+      SourceSecurityGroupId: !Ref VaultClusterSG
+      SourceSecurityGroupOwnerId: !Ref AWS::AccountId
+  VaultClusterInternalIngressPort8500:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VaultClusterSG
+      IpProtocol: tcp
+      FromPort: '8500'
+      ToPort: '8500'
+      SourceSecurityGroupId: !Ref VaultClusterSG
+      SourceSecurityGroupOwnerId: !Ref AWS::AccountId
+  VaultClusterInternalIngressPort8300:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VaultClusterSG
+      IpProtocol: tcp
+      FromPort: '8300'
+      ToPort: '8302'
+      SourceSecurityGroupId: !Ref VaultClusterSG
+      SourceSecurityGroupOwnerId: !Ref AWS::AccountId
+  VaultClusterInternalIngressPort8600:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VaultClusterSG
+      IpProtocol: tcp
+      FromPort: '8600'
+      ToPort: '8600'
+      SourceSecurityGroupId: !Ref VaultClusterSG
+      SourceSecurityGroupOwnerId: !Ref AWS::AccountId
+  VaultELBIngressPublicPorts:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VaultELBSG
+      IpProtocol: tcp
+      FromPort: '8200'
+      ToPort: '8200'
+      CidrIp: 0.0.0.0/0
+  VaultClusterEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref VaultClusterSG
+      IpProtocol: "-1"
+      CidrIp: 0.0.0.0/0
+  VaultELBEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref VaultELBSG
+      IpProtocol: "-1"
+      CidrIp: 0.0.0.0/0
+  VaultServer0:
+    Type: AWS::EC2::Instance
+    Properties:
+      DisableApiTermination: 'false'
+      InstanceInitiatedShutdownBehavior: stop
+      IamInstanceProfile: !Ref VaultInstanceProfile
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", vault]
+      InstanceType: t2.medium
+      KeyName: !Ref SSHKeyName
+      Monitoring: 'false'
+      Tags:
+      - Key: Name
+        Value: !Join [ '', [ !Ref FQDN, '_vault_server_0' ] ]
+      NetworkInterfaces:
+      - DeleteOnTermination: 'true'
+        DeviceIndex: 0
+        SubnetId: !Ref VaultPrivateSubnet0
+        PrivateIpAddresses:
+        - PrivateIpAddress: 10.0.1.10
+          Primary: 'true'
+        GroupSet:
+        - !Ref VaultClusterSG
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+
+          ##############################################################
+          # Enable Consul Auto-Discovery via AWS Tags
+          ##############################################################
+
+          cat << EOF > /etc/vault.d/consul-storage.hcl
+          datacenter = "dc1"
+          primary_datacenter = "dc1"
+          data_dir = "/opt/consul-storage/"
+          retry_join = ["provider=aws  tag_key=CONSUL_CLUSTER_TAG  tag_value=${FQDN}_vault_consul_cluster"]
+
+          performance {
+            raft_multiplier = 1
+          }
+
+          acl {
+            enabled = true
+            default_policy = "deny"
+            down_policy = "extend-cache"
+            tokens {
+              agent = "{{ acl_token }}"
+            }
+          }
+
+          EOF
+
+          # Let servers come up first
+          sleep 30
+          # Then restart consul agent
+          systemctl restart consul-storage
+
+          ##############################################################
+          # Vault and Consul client config steps
+          ##############################################################
+
+          # Fetch the Vault agent token, update our config files
+          AGENT_TOKEN=""
+
+          while [ ${!#AGENT_TOKEN} -ne 36 ]; do
+            echo "Agent token not ready yet."
+            sleep 3
+            AGENT_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${VaultConsulAgentToken} --region ${AWS::Region} --query SecretString --output text)
+          done
+
+          # Render Vault config
+          cat << EOF > /etc/vault.d/vault.hcl
+          listener "tcp" {
+            address       = "0.0.0.0:8200"
+            tls_cert_file = "/etc/ssl/certs/fullchain.pem"
+            tls_key_file  = "/etc/vault.d/certs/privkey.pem"
+          }
+
+          storage "consul" {
+            address = "127.0.0.1:8500"
+            path = "vault/"
+            token = "${!AGENT_TOKEN}"
+          }
+
+          ui = true
+
+          api_addr = "https://${FQDN}:8200"
+
+          seal "awskms" {
+            kms_key_id = "${VaultKMSKey}"
+            region = "${AWS::Region}"
+          }
+          EOF
+
+          # Update Consul config, ensure tag is unique to this cluster
+          sed -i'' "s/{{ acl_token }}/${!AGENT_TOKEN}/" /etc/vault.d/consul-storage.hcl
+
+          # Restart services
+          systemctl stop vault
+          systemctl restart consul-storage
+          systemctl start vault
+  VaultServer1:
+    Type: AWS::EC2::Instance
+    Properties:
+      DisableApiTermination: 'false'
+      InstanceInitiatedShutdownBehavior: stop
+      IamInstanceProfile: !Ref VaultInstanceProfile
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", vault]
+      InstanceType: t2.medium
+      KeyName: !Ref SSHKeyName
+      Monitoring: 'false'
+      Tags:
+      - Key: Name
+        Value: !Join [ '', [ !Ref FQDN, '_vault_server_1' ] ]
+      NetworkInterfaces:
+      - DeleteOnTermination: 'true'
+        DeviceIndex: 0
+        SubnetId: !Ref VaultPrivateSubnet1
+        PrivateIpAddresses:
+        - PrivateIpAddress: 10.0.2.11
+          Primary: 'true'
+        GroupSet:
+        - !Ref VaultClusterSG
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+
+          ##############################################################
+          # Enable Consul Auto-Discovery via AWS Tags
+          ##############################################################
+
+          cat << EOF > /etc/vault.d/consul-storage.hcl
+          datacenter = "dc1"
+          primary_datacenter = "dc1"
+          data_dir = "/opt/consul-storage/"
+          retry_join = ["provider=aws  tag_key=CONSUL_CLUSTER_TAG  tag_value=${FQDN}_vault_consul_cluster"]
+
+          performance {
+            raft_multiplier = 1
+          }
+
+          acl {
+            enabled = true
+            default_policy = "deny"
+            down_policy = "extend-cache"
+            tokens {
+              agent = "{{ acl_token }}"
+            }
+          }
+
+          EOF
+
+          # Let servers come up first
+          sleep 30
+          # Then restart consul agent
+          systemctl restart consul-storage
+
+          ##############################################################
+          # Vault and Consul client config steps
+          ##############################################################
+
+          # Fetch the Vault agent token, update our config files
+          AGENT_TOKEN=""
+
+          while [ ${!#AGENT_TOKEN} -ne 36 ]; do
+            echo "Agent token not ready yet."
+            sleep 3
+            AGENT_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${VaultConsulAgentToken} --region ${AWS::Region} --query SecretString --output text)
+          done
+
+          # Render Vault config
+          cat << EOF > /etc/vault.d/vault.hcl
+          listener "tcp" {
+            address       = "0.0.0.0:8200"
+            tls_cert_file = "/etc/ssl/certs/fullchain.pem"
+            tls_key_file  = "/etc/vault.d/certs/privkey.pem"
+          }
+
+          storage "consul" {
+            address = "127.0.0.1:8500"
+            path = "vault/"
+            token = "${!AGENT_TOKEN}"
+          }
+
+          ui = true
+
+          api_addr = "https://${FQDN}:8200"
+
+          seal "awskms" {
+            kms_key_id = "${VaultKMSKey}"
+            region = "${AWS::Region}"
+          }
+          EOF
+
+          # Update Consul config, ensure tag is unique to this cluster
+          sed -i'' "s/{{ acl_token }}/${!AGENT_TOKEN}/" /etc/vault.d/consul-storage.hcl
+
+          # Restart services
+          systemctl stop vault
+          systemctl restart consul-storage
+          systemctl start vault
+  VaultServer2:
+    Type: AWS::EC2::Instance
+    Properties:
+      DisableApiTermination: 'false'
+      InstanceInitiatedShutdownBehavior: stop
+      IamInstanceProfile: !Ref VaultInstanceProfile
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", vault]
+      InstanceType: t2.medium
+      KeyName: !Ref SSHKeyName
+      Monitoring: 'false'
+      Tags:
+      - Key: Name
+        Value: !Join [ '', [ !Ref FQDN, '_vault_server_2' ] ]
+      NetworkInterfaces:
+      - DeleteOnTermination: 'true'
+        DeviceIndex: 0
+        SubnetId: !Ref VaultPrivateSubnet2
+        PrivateIpAddresses:
+        - PrivateIpAddress: 10.0.3.12
+          Primary: 'true'
+        GroupSet:
+        - !Ref VaultClusterSG
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+
+          ##############################################################
+          # Enable Consul Auto-Discovery via AWS Tags
+          ##############################################################
+
+          cat << EOF > /etc/vault.d/consul-storage.hcl
+          datacenter = "dc1"
+          primary_datacenter = "dc1"
+          data_dir = "/opt/consul-storage/"
+          retry_join = ["provider=aws  tag_key=CONSUL_CLUSTER_TAG  tag_value=${FQDN}_vault_consul_cluster"]
+
+          performance {
+            raft_multiplier = 1
+          }
+
+          acl {
+            enabled = true
+            default_policy = "deny"
+            down_policy = "extend-cache"
+            tokens {
+              agent = "{{ acl_token }}"
+            }
+          }
+
+          EOF
+
+          # Let servers come up first
+          sleep 30
+          # Then restart consul agent
+          systemctl restart consul-storage
+
+          ##############################################################
+          # Vault and Consul client config steps
+          ##############################################################
+
+          # Fetch the Vault agent token, update our config files
+          AGENT_TOKEN=""
+
+          while [ ${!#AGENT_TOKEN} -ne 36 ]; do
+            echo "Agent token not ready yet."
+            sleep 3
+            AGENT_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${VaultConsulAgentToken} --region ${AWS::Region} --query SecretString --output text)
+          done
+
+          # Render Vault config
+          cat << EOF > /etc/vault.d/vault.hcl
+          listener "tcp" {
+            address       = "0.0.0.0:8200"
+            tls_cert_file = "/etc/ssl/certs/fullchain.pem"
+            tls_key_file  = "/etc/vault.d/certs/privkey.pem"
+          }
+
+          storage "consul" {
+            address = "127.0.0.1:8500"
+            path = "vault/"
+            token = "${!AGENT_TOKEN}"
+          }
+
+          ui = true
+
+          api_addr = "https://${FQDN}:8200"
+
+          seal "awskms" {
+            kms_key_id = "${VaultKMSKey}"
+            region = "${AWS::Region}"
+          }
+          EOF
+
+          # Update Consul config, ensure tag is unique to this cluster
+          sed -i'' "s/{{ acl_token }}/${!AGENT_TOKEN}/" /etc/vault.d/consul-storage.hcl
+
+          # Restart services
+          systemctl stop vault
+          systemctl restart consul-storage
+          systemctl start vault
+  ConsulServer0:
+    Type: AWS::EC2::Instance
+    Properties:
+      DisableApiTermination: 'false'
+      InstanceInitiatedShutdownBehavior: stop
+      IamInstanceProfile: !Ref VaultInstanceProfile
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", consul]
+      InstanceType: t2.medium
+      KeyName: !Ref SSHKeyName
+      Monitoring: 'false'
+      Tags:
+      - Key: Name
+        Value: !Join [ '', [ !Ref FQDN, '_consul_server_0' ] ]
+      - Key: CONSUL_CLUSTER_TAG
+        Value: !Join [ '', [ !Ref FQDN, '_vault_consul_cluster' ] ]
+      NetworkInterfaces:
+      - DeleteOnTermination: 'true'
+        DeviceIndex: 0
+        SubnetId: !Ref VaultPrivateSubnet0
+        PrivateIpAddresses:
+        - PrivateIpAddress: 10.0.1.20
+          Primary: 'true'
+        GroupSet:
+        - !Ref VaultClusterSG
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+
+          # This machine is responsible for generating the Consul Agent Token
+          # and storing it in AWS Secrets Manager so the other machines can read it.
+
+          ##############################################################
+          # Consul Server Configuration
+          ##############################################################
+
+          # Blow away the existing Consul server configuration and restart it.
+          cat << EOF > /etc/vault.d/consul-storage.hcl
+          datacenter = "dc1"
+          primary_datacenter = "dc1"
+          server = true
+          data_dir = "/opt/consul-storage/"
+          bootstrap_expect = 3
+          ui = true
+          retry_join = ["provider=aws  tag_key=CONSUL_CLUSTER_TAG  tag_value=${FQDN}_vault_consul_cluster"]
+
+          performance {
+            raft_multiplier = 1
+          }
+
+          acl {
+            enabled = true
+            default_policy = "deny"
+            down_policy = "extend-cache"
+            tokens {
+              agent = "{{ acl_token }}"
+            }
+          }
+
+          EOF
+
+          systemctl restart consul-storage
+
+          # Give the servers some time to start up and join the cluster
+          sleep 30
+
+          ##############################################################
+          # Consul ACL Setup Steps
+          ##############################################################
+
+          # Enter bootstrap mode, get an agent token, save to /tmp
+          # This is the bootstrap, or management token. It has superuser powers.
+          MT=`curl --request PUT http://127.0.0.1:8500/v1/acl/bootstrap |cut -d'"' -f4`
+          echo ${!MT} > /tmp/management_token
+          # Uncomment if you want to keep a copy of the bootstrap token on the host.
+          #echo ${!MT} > $HOME/consul_root_token
+
+          # Store the management token in AWS Secrets Manager for safekeeping
+          aws secretsmanager update-secret --secret-id ${ConsulBootstrapToken} --description "Consul Bootstrap Token - Created" --secret-string file:///tmp/management_token --kms-key-id ${VaultKMSKey} --region ${AWS::Region}
+
+          # Create a consul ACL policy for our Consul servers
+          curl --request PUT --header "X-Consul-Token: ${!MT}" --data '{"Name": "consul-server-token", "Rules": "{\"node_prefix\":{\"\":{\"policy\":\"write\"}},\"service_prefix\":{\"\":{\"policy\":\"read\"}}}" }' http://127.0.0.1:8500/v1/acl/policy
+
+          # Create a token for consul servers
+          CT=`curl --request PUT --header "X-Consul-Token: ${!MT}" --data '{ "Description": "Consul server agent token.", "Policies": [{ "Name": "consul-server-token"}], "Local": false}' http://127.0.0.1:8500/v1/acl/token | cut -d'"' -f8`
+          echo ${!CT} > /tmp/consul_server_token
+
+          # Store the Consul server agent token in AWS Secrets Manager so the other nodes can reach it
+          aws secretsmanager update-secret --secret-id ${ConsulServerAgentToken} --description "Consul Server Agent Token - Created" --secret-string file:///tmp/consul_server_token --kms-key-id ${VaultKMSKey} --region ${AWS::Region}
+
+          # Create a policy for our Vault servers
+          curl --request PUT --header "X-Consul-Token: ${!MT}" --data '{"Name": "vault-consul-token", "Rules": "{\"key_prefix\":{\"vault/\":{\"policy\":\"write\"}},\"node_prefix\":{\"\":{\"policy\":\"write\"}},\"service\":{\"vault\":{\"policy\":\"write\"}},\"agent_prefix\":{\"\":{\"policy\":\"write\"}},\"session_prefix\":{\"\":{\"policy\":\"write\"}}}" }'  http://127.0.0.1:8500/v1/acl/policy
+
+          # Create a token for vault storage
+          AT=`curl --request PUT --header "X-Consul-Token: ${!MT}" --data '{ "Description": "Vault agent token for consul storage.", "Policies": [{ "Name": "vault-consul-token"}], "Local": false}' http://127.0.0.1:8500/v1/acl/token | cut -d'"' -f8`
+          echo ${!AT} > /tmp/vault_consul_token
+
+          # Store the Vault Consul agent token in AWS Secrets Manager so the other nodes can reach it
+          aws secretsmanager update-secret --secret-id ${VaultConsulAgentToken} --description "Consul Agent Token - Created" --secret-string file:///tmp/vault_consul_token --kms-key-id ${VaultKMSKey} --region ${AWS::Region}
+
+          # Remove the locally stored tokens
+          rm /tmp/management_token
+          rm /tmp/vault_consul_token
+          rm /tmp/consul_server_token
+
+          # Fetch the Consul agent token, update our config files
+          AGENT_TOKEN=""
+
+          while [ ${!#AGENT_TOKEN} -ne 36 ]; do
+            echo "Agent token not ready yet."
+            sleep 3
+            AGENT_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${ConsulServerAgentToken} --region ${AWS::Region} --query SecretString --output text)
+          done
+
+          # Update Consul config, ensure tag is unique to this cluster
+          sed -i'' "s/{{ acl_token }}/${!AGENT_TOKEN}/" /etc/vault.d/consul-storage.hcl
+
+          # Restart services
+          systemctl restart consul-storage
+  ConsulServer1:
+    Type: AWS::EC2::Instance
+    Properties:
+      DisableApiTermination: 'false'
+      InstanceInitiatedShutdownBehavior: stop
+      IamInstanceProfile: !Ref VaultInstanceProfile
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", consul]
+      InstanceType: t2.medium
+      KeyName: !Ref SSHKeyName
+      Monitoring: 'false'
+      Tags:
+      - Key: Name
+        Value: !Join [ '', [ !Ref FQDN, '_consul_server_1' ] ]
+      - Key: CONSUL_CLUSTER_TAG
+        Value: !Join [ '', [ !Ref FQDN, '_vault_consul_cluster' ] ]
+      NetworkInterfaces:
+      - DeleteOnTermination: 'true'
+        DeviceIndex: 0
+        SubnetId: !Ref VaultPrivateSubnet1
+        PrivateIpAddresses:
+        - PrivateIpAddress: 10.0.2.21
+          Primary: 'true'
+        GroupSet:
+        - !Ref VaultClusterSG
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          ##############################################################
+          # Consul Server Configuration
+          ##############################################################
+
+          # Blow away the existing Consul server configuration and restart it.
+          cat << EOF > /etc/vault.d/consul-storage.hcl
+          datacenter = "dc1"
+          primary_datacenter = "dc1"
+          server = true
+          data_dir = "/opt/consul-storage/"
+          bootstrap_expect = 3
+          ui = true
+          retry_join = ["provider=aws  tag_key=CONSUL_CLUSTER_TAG  tag_value=${FQDN}_vault_consul_cluster"]
+
+          performance {
+            raft_multiplier = 1
+          }
+
+          acl {
+            enabled = true
+            default_policy = "deny"
+            down_policy = "extend-cache"
+            tokens {
+              agent = "{{ acl_token }}"
+            }
+          }
+
+          EOF
+
+          systemctl restart consul-storage
+
+          # Fetch the Consul agent token, update our config files
+          AGENT_TOKEN=""
+
+          while [ ${!#AGENT_TOKEN} -ne 36 ]; do
+            echo "Agent token not ready yet."
+            sleep 3
+            AGENT_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${ConsulServerAgentToken} --region ${AWS::Region} --query SecretString --output text)
+          done
+
+          # Update Consul config, ensure tag is unique to this cluster
+          sed -i'' "s/{{ acl_token }}/${!AGENT_TOKEN}/" /etc/vault.d/consul-storage.hcl
+
+          # Restart services
+          systemctl restart consul-storage
+  ConsulServer2:
+    Type: AWS::EC2::Instance
+    Properties:
+      DisableApiTermination: 'false'
+      InstanceInitiatedShutdownBehavior: stop
+      IamInstanceProfile: !Ref VaultInstanceProfile
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", consul]
+      InstanceType: t2.medium
+      KeyName: !Ref SSHKeyName
+      Monitoring: 'false'
+      Tags:
+      - Key: Name
+        Value: !Join [ '', [ !Ref FQDN, '_consul_server_2' ] ]
+      - Key: CONSUL_CLUSTER_TAG
+        Value: !Join [ '', [ !Ref FQDN, '_vault_consul_cluster' ] ]
+      NetworkInterfaces:
+      - DeleteOnTermination: 'true'
+        DeviceIndex: 0
+        SubnetId: !Ref VaultPrivateSubnet2
+        PrivateIpAddresses:
+        - PrivateIpAddress: 10.0.3.22
+          Primary: 'true'
+        GroupSet:
+        - !Ref VaultClusterSG
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          ##############################################################
+          # Consul Server Configuration
+          ##############################################################
+
+          # Blow away the existing Consul server configuration and restart it.
+          cat << EOF > /etc/vault.d/consul-storage.hcl
+          datacenter = "dc1"
+          primary_datacenter = "dc1"
+          server = true
+          data_dir = "/opt/consul-storage/"
+          bootstrap_expect = 3
+          ui = true
+          retry_join = ["provider=aws  tag_key=CONSUL_CLUSTER_TAG  tag_value=${FQDN}_vault_consul_cluster"]
+
+          performance {
+            raft_multiplier = 1
+          }
+
+          acl {
+            enabled = true
+            default_policy = "deny"
+            down_policy = "extend-cache"
+            tokens {
+              agent = "{{ acl_token }}"
+            }
+          }
+
+          EOF
+
+          systemctl restart consul-storage
+
+          # Fetch the Consul agent token, update our config files
+          AGENT_TOKEN=""
+
+          while [ ${!#AGENT_TOKEN} -ne 36 ]; do
+            echo "Agent token not ready yet."
+            sleep 3
+            AGENT_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${ConsulServerAgentToken} --region ${AWS::Region} --query SecretString --output text)
+          done
+
+          # Update Consul config, ensure tag is unique to this cluster
+          sed -i'' "s/{{ acl_token }}/${!AGENT_TOKEN}/" /etc/vault.d/consul-storage.hcl
+
+          # Restart services
+          systemctl restart consul-storage
+  ConsulServer3:
+    Type: AWS::EC2::Instance
+    Properties:
+      DisableApiTermination: 'false'
+      InstanceInitiatedShutdownBehavior: stop
+      IamInstanceProfile: !Ref VaultInstanceProfile
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", consul]
+      InstanceType: t2.medium
+      KeyName: !Ref SSHKeyName
+      Monitoring: 'false'
+      Tags:
+      - Key: Name
+        Value: !Join [ '', [ !Ref FQDN, '_consul_server_3' ] ]
+      - Key: CONSUL_CLUSTER_TAG
+        Value: !Join [ '', [ !Ref FQDN, '_vault_consul_cluster' ] ]
+      NetworkInterfaces:
+      - DeleteOnTermination: 'true'
+        DeviceIndex: 0
+        SubnetId: !Ref VaultPrivateSubnet0
+        PrivateIpAddresses:
+        - PrivateIpAddress: 10.0.1.23
+          Primary: 'true'
+        GroupSet:
+        - !Ref VaultClusterSG
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          ##############################################################
+          # Consul Server Configuration
+          ##############################################################
+
+          # Blow away the existing Consul server configuration and restart it.
+          cat << EOF > /etc/vault.d/consul-storage.hcl
+          datacenter = "dc1"
+          primary_datacenter = "dc1"
+          server = true
+          data_dir = "/opt/consul-storage/"
+          bootstrap_expect = 3
+          ui = true
+          retry_join = ["provider=aws  tag_key=CONSUL_CLUSTER_TAG  tag_value=${FQDN}_vault_consul_cluster"]
+
+          performance {
+            raft_multiplier = 1
+          }
+
+          acl {
+            enabled = true
+            default_policy = "deny"
+            down_policy = "extend-cache"
+            tokens {
+              agent = "{{ acl_token }}"
+            }
+          }
+
+          EOF
+
+          systemctl restart consul-storage
+
+          # Fetch the Consul agent token, update our config files
+          AGENT_TOKEN=""
+
+          while [ ${!#AGENT_TOKEN} -ne 36 ]; do
+            echo "Agent token not ready yet."
+            sleep 3
+            AGENT_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${ConsulServerAgentToken} --region ${AWS::Region} --query SecretString --output text)
+          done
+
+          # Update Consul config, ensure tag is unique to this cluster
+          sed -i'' "s/{{ acl_token }}/${!AGENT_TOKEN}/" /etc/vault.d/consul-storage.hcl
+
+          # Restart services
+          systemctl restart consul-storage
+  ConsulServer4:
+    Type: AWS::EC2::Instance
+    Properties:
+      DisableApiTermination: 'false'
+      InstanceInitiatedShutdownBehavior: stop
+      IamInstanceProfile: !Ref VaultInstanceProfile
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", consul]
+      InstanceType: t2.medium
+      KeyName: !Ref SSHKeyName
+      Monitoring: 'false'
+      Tags:
+      - Key: Name
+        Value: !Join [ '', [ !Ref FQDN, '_consul_server_4' ] ]
+      - Key: CONSUL_CLUSTER_TAG
+        Value: !Join [ '', [ !Ref FQDN, '_vault_consul_cluster' ] ]
+      NetworkInterfaces:
+      - DeleteOnTermination: 'true'
+        DeviceIndex: 0
+        SubnetId: !Ref VaultPrivateSubnet1
+        PrivateIpAddresses:
+        - PrivateIpAddress: 10.0.2.24
+          Primary: 'true'
+        GroupSet:
+        - !Ref VaultClusterSG
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          ##############################################################
+          # Consul Server Configuration
+          ##############################################################
+
+          # Blow away the existing Consul server configuration and restart it.
+          cat << EOF > /etc/vault.d/consul-storage.hcl
+          datacenter = "dc1"
+          primary_datacenter = "dc1"
+          server = true
+          data_dir = "/opt/consul-storage/"
+          bootstrap_expect = 3
+          ui = true
+          retry_join = ["provider=aws  tag_key=CONSUL_CLUSTER_TAG  tag_value=${FQDN}_vault_consul_cluster"]
+
+          performance {
+            raft_multiplier = 1
+          }
+
+          acl {
+            enabled = true
+            default_policy = "deny"
+            down_policy = "extend-cache"
+            tokens {
+              agent = "{{ acl_token }}"
+            }
+          }
+
+          EOF
+
+          systemctl restart consul-storage
+
+          # Fetch the Consul agent token, update our config files
+          AGENT_TOKEN=""
+
+          while [ ${!#AGENT_TOKEN} -ne 36 ]; do
+            echo "Agent token not ready yet."
+            sleep 3
+            AGENT_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${ConsulServerAgentToken} --region ${AWS::Region} --query SecretString --output text)
+          done
+
+          # Update Consul config, ensure tag is unique to this cluster
+          sed -i'' "s/{{ acl_token }}/${!AGENT_TOKEN}/" /etc/vault.d/consul-storage.hcl
+
+          # Restart services
+          systemctl restart consul-storage
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      DisableApiTermination: 'false'
+      InstanceInitiatedShutdownBehavior: stop
+      ImageId: !Ref BastionAmiId
+      InstanceType: t2.micro
+      KeyName: !Ref SSHKeyName
+      Monitoring: 'false'
+      Tags:
+      - Key: Name
+        Value: !Join [ '', [ !Ref FQDN, '_bastion_host' ] ]
+      NetworkInterfaces:
+      - DeleteOnTermination: 'true'
+        DeviceIndex: 0
+        AssociatePublicIpAddress: 'true'
+        SubnetId: !Ref VaultPublicSubnet0
+        GroupSet:
+        - !Ref VaultClusterSG
+Outputs:
+  VaultAPI:
+    Description: The public URL for your Vault API and web console.
+    Value: !Join [ '', [ 'https://', !Ref FQDN, ':8200']]
+  VaultELB:
+    Description: The public URL of your Vault Load Balancer. Create a CNAME record pointing at this Load Balancer.
+    Value: !Join [ '', [ 'https://', !GetAtt VaultELB.DNSName, ':8200']]
+  BastionIp:
+    Value:
+      Fn::GetAtt:
+      - BastionHost
+      - PublicIp
+    Description: Public IP address of the Bastion host. This is the only way to SSH into your Vault cluster.
+Description: Vault AWS Cloudformation
