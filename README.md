@@ -1,30 +1,30 @@
-# vault-aws-cloudformation
-
-NOTE: This repository is not being actively maintained. Contact your HashiCorp representative or community leader for the latest on installing Vault on AWS.
-
-## Introduction
-
-This repository contains code for building Amazon Machine Images (AMI) and a generic Cloudformation template. The AMI and template can be used to spin up a production-ready Vault cluster.
-
-## What does it build?
-
-The Cloudformation templates published by this pipeline stand up the following configuration:
-
-- VPC with 3 public and 3 private subnets
-- Operating system for Vault and Consul is Centos 7
-- Operating system for the Bastion host is AWS Linux (latest)
-- 3 Vault servers and 5 Consul servers distributed across the private subnets
-- A bastion host for connecting to the other servers, which are not directly accessible from the Internet
-- A real SSL certificate tied to your FQDN, managed by Amazon Certificate Manager
-- Automatic unsealing of Vault using AWS Key Management Service to store the unseal key
-- The Vault cluster will be ready in 10-15 minutes. The cluster comes up in an uninitialized state. The API listens on port 8200 and is accessible from the Internet.
-
-## Instructions for use
-
-* Build AMIs for Vault and Consul using the included Packer templates. 
-* Edit the cloudformation/aws_vault_cf.yml file and insert your new values for the AMIs.
-* OPTIONAL: Have a domain (or subdomain) that you own in AWS Route 53 management. This allows you to automate the creation of DNS records that point at your Vault cluster. It also allows you to automatically validate the SSL certificate.
-* Use the AWS Cloudformation UI to upload your aws_vault_cf.yml file, fill in all the necessary values and create a new stack. Make sure and verify the DNS record that you used for the Vault cluster in Route 53 (or by creating a DNS TXT record in your own DNS provider).
-* After about 15 minutes your Vault cluster will be ready for initial setup. You can use 1 and 1 for the initial key shares and recovery shares. Save the initial root token and recovery key in a safe place.
-* Log onto your Vault cluster using the root token and configure Vault. 
 # AWS
+
+NOTA: Este repositório não está sendo mantido ativamente. Entre em contato com seu representante HashiCorp ou líder da comunidade para obter as últimas informações sobre a instalação do Vault na AWS.
+
+## Introdução
+
+Este repositório contém código para criar Amazon Machine Images (AMI) e um modelo Cloudformation genérico. A AMI e o modelo podem ser usados para criar um cluster Vault pronto para produção.
+
+## O que ele constrói?
+
+Os templates do Cloudformation publicados por este pipeline possuem a seguinte configuração:
+
+- VPC com 3 sub-redes públicas e 3 privadas
+- Sistema operacional para Vault e Consul é o Centos 7
+- O sistema operacional para o host Bastion é AWS Linux (mais recente)
+- 3 servidores Vault e 5 servidores Consul distribuídos pelas sub-redes privadas
+- Um bastion host para conexão com outros servidores, que não são diretamente acessíveis pela Internet
+- Um certificado SSL real vinculado ao seu FQDN, gerenciado pelo Amazon Certificate Manager
+- Abertura automática do Vault usando o AWS Key Management Service para armazenar a chave de abertura
+- O cluster do Vault estará pronto em 10 a 15 minutos. O cluster surge em um estado não inicializado. A API atende na porta 8200 e pode ser acessada pela Internet.
+
+## Instruções de uso
+
+* Crie AMIs para Vault e Consul usando os modelos Packer incluídos.
+* Edite o arquivo cloudformation/aws_vault_cf.yml e insira seus novos valores para as AMIs.
+* OPCIONAL: Tenha um domínio (ou subdomínio) de sua propriedade no gerenciamento do AWS Route 53. Isso permite automatizar a criação de registros DNS que apontam para o cluster do Vault. Também permite validar automaticamente o certificado SSL.
+* Use a IU do AWS Cloudformation para carregar seu arquivo aws_vault_cf.yml, preencha todos os valores necessários e crie uma nova pilha. Certifique-se e verifique o registro DNS que você usou para o cluster Vault no Route 53 (ou criando um registro DNS TXT em seu próprio provedor DNS).
+* Após cerca de 15 minutos, seu cluster do Vault estará pronto para a configuração inicial. Você pode usar 1 e 1 para os compartilhamentos de chaves iniciais e compartilhamentos de recuperação. Salve o token raiz inicial e a chave de recuperação em um local seguro.
+* Faça login no cluster do Vault usando o token raiz e configure o Vault.
+#AWS
