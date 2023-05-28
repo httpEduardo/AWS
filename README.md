@@ -28,3 +28,5 @@ Os templates do Cloudformation publicados por este pipeline possuem a seguinte c
 * Após cerca de 15 minutos, seu cluster do Vault estará pronto para a configuração inicial. Você pode usar 1 e 1 para os compartilhamentos de chaves iniciais e compartilhamentos de recuperação. Salve o token raiz inicial e a chave de recuperação em um local seguro.
 * Faça login no cluster do Vault usando o token raiz e configure o Vault.
 #AWS
+
+By: HTTPEDUARDO
