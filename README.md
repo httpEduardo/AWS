@@ -29,4 +29,4 @@ Os templates do Cloudformation publicados por este pipeline possuem a seguinte c
 * Faça login no cluster do Vault usando o token raiz e configure o Vault.
 #AWS
 
-By: HTTPEDUARDO
+By: httpedu and other contributors
